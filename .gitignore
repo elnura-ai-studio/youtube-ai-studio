@@ -39,3 +39,16 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+# secret keys
+.env
+.env.local
+backend/.env
+backend/.env.local
+backend/venv/
+backend/__pycache__/
+backend/*.mp3
+backend/*.mp4
+backend/visual_*.png
+backend/speech_*.mp3
+backend/venv/
+backend/__pycache__/
