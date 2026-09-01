@@ -9,7 +9,18 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 
-latest_visual_plan = ""
+import pipeline
+import jobs
+from pipeline import (
+    channel_run_dir,
+    character_bible_path,
+    character_ref_path,
+    run_path,
+    safe_channel_key,
+)
+
+# Этап 1: один план на КАНАЛ, а не одна глобальная строка на весь процесс.
+latest_visual_plans: dict[str, str] = {}
 
 app = FastAPI()
 client = OpenAI()
@@ -114,13 +125,13 @@ from pathlib import Path
 import uuid
 from fastapi.responses import FileResponse
 @app.get("/autopilot/voice")
-def generate_voice(text: str):
-    speech_file_path = Path(__file__).parent / "speech.mp3"
+def generate_voice(text: str, channel_id: str):
+    speech_file_path = run_path(channel_id, "speech.mp3")
 
     chunks = [text[i:i+3000] for i in range(0, len(text), 3000)]
     audio_parts = []
     for index, chunk in enumerate(chunks):
-        part_path = Path(__file__).parent / f"speech_{uuid.uuid4().hex}_{index}.mp3"
+        part_path = run_path(channel_id, f"speech_{uuid.uuid4().hex}_{index}.mp3")
 
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
@@ -149,8 +160,8 @@ def generate_voice(text: str):
     }
 
 @app.get("/autopilot/audio")
-def get_audio():
-    speech_file_path = Path(__file__).parent / "speech.mp3"
+def get_audio(channel_id: str):
+    speech_file_path = run_path(channel_id, "speech.mp3")
     return FileResponse(
         speech_file_path,
         media_type="audio/mpeg",
@@ -158,8 +169,8 @@ def get_audio():
     )
 
 @app.post("/autopilot/upload-character-photo")
-async def upload_character_photo(file: UploadFile = File(...)):
-    photo_path = Path(__file__).parent / "character_photo.jpg"
+async def upload_character_photo(channel_id: str, file: UploadFile = File(...)):
+    photo_path = run_path(channel_id, "character_photo.jpg")
 
     with open(photo_path, "wb") as buffer:
         buffer.write(await file.read())
@@ -177,8 +188,6 @@ def generate_visual_plan(
     channel_id: str,
     use_character_photo: bool = False,
 ):
-    global latest_visual_plan
-
     # 1. character/style теперь обязательные (без "" по умолчанию) — вызов
     # без них (например, старая кнопка "Создать план визуалов") получит
     # ошибку вместо того, чтобы тихо затереть план текущего канала пустым.
@@ -187,11 +196,11 @@ def generate_visual_plan(
     # build_video() не мог случайно подхватить картинки от другого канала,
     # если какая-то из сцен не перегенерируется в этом запуске.
     for scene_name in ("visual_1.png", "visual_2.png", "visual_3.png"):
-        scene_path = Path(__file__).parent / scene_name
+        scene_path = run_path(channel_id, scene_name)
         if scene_path.exists():
             scene_path.unlink()
 
-    photo_path = Path(__file__).parent / "character_photo.jpg"
+    photo_path = run_path(channel_id, "character_photo.jpg")
 
     # КРИТИЧНО (найдено при проверке полного pipeline, баг существовал ещё
     # в main-old.py, задолго до этого раунда правок):
@@ -255,7 +264,7 @@ def generate_visual_plan(
             input=prompt_text,
         )
 
-    latest_visual_plan = response.output_text
+    latest_visual_plans[safe_channel_key(channel_id)] = response.output_text
     return {
         "status": "ok",
         "visual_plan": response.output_text
@@ -268,7 +277,7 @@ def visual_image_test():
     }
    
 @app.get("/autopilot/visual-image")
-def generate_visual_image(prompt: str):
+def generate_visual_image(prompt: str, channel_id: str):
     result = client.images.generate(
         model="gpt-image-2",
         prompt=prompt,
@@ -278,7 +287,7 @@ def generate_visual_image(prompt: str):
     image_base64 = result.data[0].b64_json
     image_bytes = base64.b64decode(image_base64)
 
-    image_path = Path(__file__).parent / "visual_1.png"
+    image_path = run_path(channel_id, "visual_1.png")
     image_path.write_bytes(image_bytes)
 
     return {
@@ -288,8 +297,8 @@ def generate_visual_image(prompt: str):
     from fastapi.responses import FileResponse
 
 @app.get("/autopilot/visual-image-file")
-def get_visual_image():
-    image_path = Path(__file__).parent / "visual_1.png"
+def get_visual_image(channel_id: str):
+    image_path = run_path(channel_id, "visual_1.png")
     return FileResponse(
         image_path,
         media_type="image/png"
@@ -492,8 +501,8 @@ def get_or_create_character_bible(
     # ролика этого канала. Имя файла зависит только от channel_id — тот же
     # safe_channel_key, что и у character_ref_<channel_id>.png, поэтому
     # каналы не могут случайно поделить один и тот же bible.
-    project_dir = Path(__file__).parent
-    bible_path = project_dir / f"character_bible_{safe_channel_key(channel_id)}.json"
+    project_dir = channel_run_dir(channel_id)
+    bible_path = character_bible_path(channel_id)
     if bible_path.exists():
         try:
             return json.loads(bible_path.read_text(encoding="utf-8"))
@@ -507,7 +516,7 @@ def get_or_create_character_bible(
     #    (character_ref_<channel_id>.png — либо из analyze_channel по
     #    реальным thumbnail, либо закреплённый по итогам прошлых роликов);
     # 3) только если ничего визуального нет — текстовое описание (fallback).
-    channel_reference_path = project_dir / f"character_ref_{safe_channel_key(channel_id)}.png"
+    channel_reference_path = character_ref_path(channel_id)
     photo_path = project_dir / "character_photo.jpg"
 
     if use_character_photo and photo_path.exists():
@@ -559,7 +568,7 @@ def reset_character_bible(channel_id: str):
     # /autopilot/visual-plan или /autopilot/generate-scene для этого же
     # channel_id просто не найдёт файл и сгенерирует bible заново с нуля
     # (см. get_or_create_character_bible), без дополнительных действий.
-    bible_path = Path(__file__).parent / f"character_bible_{safe_channel_key(channel_id)}.json"
+    bible_path = character_bible_path(channel_id)
     existed = bible_path.exists()
     if existed:
         bible_path.unlink()
@@ -621,8 +630,7 @@ def generate_scene(
     use_character_photo: bool = False,
     keep_characters: bool = False,
 ):
-    global latest_visual_plan
-
+    latest_visual_plan = latest_visual_plans.get(safe_channel_key(channel_id), "")
     if not latest_visual_plan:
         return {"status": "error", "message": "Визуальный план ещё не создан"}
 
@@ -638,9 +646,9 @@ def generate_scene(
     # Только описание ТЕКУЩЕЙ сцены + единый якорь персонажей — не весь план.
     prompt = f"{character_reference_prompt}\n\nСцена {scene_id}: {scene_description}"
 
-    project_dir = Path(__file__).parent
+    project_dir = channel_run_dir(channel_id)
     photo_path = project_dir / "character_photo.jpg"
-    scene1_path = project_dir / "visual_1.png"
+    previous_scene_path = project_dir / f"visual_{scene_id - 1}.png"
 
     # Постоянный эталон внешности ЭТОГО канала между РАЗНЫМИ роликами.
     # Имя файла зависит только от channel_id, поэтому у разных каналов
@@ -649,7 +657,7 @@ def generate_scene(
     # персонажей" (keep_characters) — тот же флаг, что уже есть в UI
     # (чекбокс "Сохранять постоянных персонажей" -> keepCharacters), т.е.
     # ничего нового пользователю решать не нужно.
-    channel_reference_path = project_dir / f"character_ref_{safe_channel_key(channel_id)}.png"
+    channel_reference_path = character_ref_path(channel_id)
 
     # use_character_photo — явный признак от фронтенда, что для ТЕКУЩЕГО
     # канала реально выбран режим "Загрузить фото персонажей". Одного
@@ -660,52 +668,38 @@ def generate_scene(
     # игнорируется, даже если физически лежит на диске.
     use_photo_reference = use_character_photo and photo_path.exists()
 
-    if scene_id == 1:
-        if use_photo_reference:
-            # Явно загруженное пользователем фото — самый сильный сигнал,
-            # приоритет выше сохранённого авто-референса канала.
-            result = client.images.generate(
-                model="gpt-image-2",
-                prompt=prompt,
-                size="1536x1024"
-            )
-        elif channel_reference_path.exists():
-            # Реальный/устоявшийся референс канала уже есть на диске — либо
-            # из analyze_channel (реальный thumbnail), либо закреплён
-            # прошлым роликом с keep_characters. Используем его как эталон
-            # независимо от keep_characters: это лучшая доступная информация
-            # о реальной внешности персонажей, а не только про то, нужно ли
-            # ЗАПОМИНАТЬ результат для будущих роликов (см. ниже).
-            with open(channel_reference_path, "rb") as reference_file:
-                result = client.images.edit(
-                    model="gpt-image-2",
-                    image=reference_file,
-                    prompt=prompt + REFERENCE_PROMPT_SUFFIX,
-                    size="1536x1024"
-                )
-        else:
-            # Первый ролик этого канала (или канал без keep_characters) —
-            # референса ещё нет / не нужен, генерируем с нуля.
-            result = client.images.generate(
-                model="gpt-image-2",
-                prompt=prompt,
-                size="1536x1024"
-            )
+    # Этап 2: character_ref.png — ПОСТОЯННЫЙ эталон канала. Он всегда идёт
+    # первым референсом и НИКОГДА не перезаписывается результатом сцены,
+    # поэтому внешность не "дрейфует" от кадра к кадру. Предыдущая сцена
+    # передаётся только вторым изображением — для света/фона, не для лица.
+    primary_reference = None
+    if use_photo_reference:
+        primary_reference = photo_path
+    elif channel_reference_path.exists():
+        primary_reference = channel_reference_path
+
+    secondary_reference = previous_scene_path if (scene_id > 1 and previous_scene_path.exists()) else None
+
+    if primary_reference is None:
+        result = client.images.generate(
+            model="gpt-image-2",
+            prompt=prompt,
+            size="1536x1024",
+        )
     else:
-        # Сцены 2 и 3 текущего ролика: визуальный референс вместо генерации
-        # "с нуля" — приоритет: загруженное фото ЭТОГО канала (если режим
-        # фото реально включён), иначе — сцена 1 этого же ролика (которая,
-        # в свою очередь, уже опирается на channel_reference_path, если он
-        # был). Так все 3 сцены одного ролика гарантированно используют
-        # один и тот же визуальный якорь.
-        reference_path = photo_path if use_photo_reference else scene1_path
-        with open(reference_path, "rb") as reference_file:
+        open_files = [open(primary_reference, "rb")]
+        if secondary_reference is not None:
+            open_files.append(open(secondary_reference, "rb"))
+        try:
             result = client.images.edit(
                 model="gpt-image-2",
-                image=reference_file,
+                image=open_files if len(open_files) > 1 else open_files[0],
                 prompt=prompt + REFERENCE_PROMPT_SUFFIX,
-                size="1536x1024"
+                size="1536x1024",
             )
+        finally:
+            for handle in open_files:
+                handle.close()
 
     image_base64 = result.data[0].b64_json
     image_bytes = base64.b64decode(image_base64)
@@ -713,11 +707,9 @@ def generate_scene(
     image_path = project_dir / f"visual_{scene_id}.png"
     image_path.write_bytes(image_bytes)
 
-    # Сцена 1 без явного фото-режима, для канала с keep_characters,
-    # становится новым/обновлённым эталоном ЭТОГО канала — следующий
-    # ролик того же канала снова начнёт со сцены, похожей на предыдущие,
-    # а не со случайной новой генерации персонажей.
-    if scene_id == 1 and keep_characters and not use_photo_reference:
+    # Если у канала эталона ещё нет вообще — первая сцена его ЗАДАЁТ один раз.
+    # Дальше он неизменен: результаты сцен эталон не перезаписывают.
+    if scene_id == 1 and not use_photo_reference and not channel_reference_path.exists():
         channel_reference_path.write_bytes(image_bytes)
 
     return {
@@ -727,12 +719,11 @@ def generate_scene(
     }
 
 @app.get("/autopilot/build-video")
-def build_video():
-    global latest_visual_plan
-    project_dir = Path(__file__).parent
+def build_video(channel_id: str):
+    project_dir = channel_run_dir(channel_id)
     speech_path = project_dir / "speech.mp3"
     output_path = project_dir / "first_video.mp4"
-    ffmpeg_bin = "/opt/homebrew/bin/ffmpeg"
+    ffmpeg_bin = pipeline.FFMPEG_BIN
     # ffprobe выводится из пути ffmpeg (тот же bin-каталог Homebrew),
     # а не хардкодится отдельно — так путь верен и на Apple Silicon (/opt/homebrew),
     # и на Intel Mac (/usr/local), если ffmpeg_bin вообще указан правильно
@@ -849,7 +840,7 @@ def build_video():
     # клик "Собрать видео" без нового плана явно упадёт в generate-scene
     # ("Визуальный план ещё не создан") вместо тихого использования плана
     # от предыдущего запуска/канала.
-    latest_visual_plan = ""
+    latest_visual_plans.pop(safe_channel_key(channel_id), None)
 
     # Сбрасываем и загруженное фото персонажей вместе с планом: иначе оно
     # оставалось бы на диске навсегда и generate_scene молча использовал бы
@@ -868,8 +859,8 @@ def build_video():
         "video_file": "first_video.mp4"
     }
 @app.get("/autopilot/video-file")
-def get_video_file():
-    video_path = Path(__file__).parent / "first_video.mp4"
+def get_video_file(channel_id: str):
+    video_path = run_path(channel_id, "first_video.mp4")
     return FileResponse(
         video_path,
         media_type="video/mp4"
@@ -971,11 +962,17 @@ def analyze_channel(channel: str, channel_id: str):
     visual_reference_saved = False
     if candidate_images:
         chosen_image_bytes = _select_best_character_thumbnail(candidate_images)
-        project_dir = Path(__file__).parent
-        channel_reference_path = project_dir / f"character_ref_{safe_channel_key(channel_id)}.png"
+        channel_reference_path = character_ref_path(channel_id)
         try:
-            channel_reference_path.write_bytes(chosen_image_bytes)
-            visual_reference_saved = True
+            if channel_reference_path.exists():
+                # Этап 2: постоянный эталон канала не перезаписывается
+                # повторным анализом — внешность персонажа фиксирована.
+                visual_reference_saved = False
+                return_early_bible_cleanup = False
+            else:
+                channel_reference_path.write_bytes(chosen_image_bytes)
+                visual_reference_saved = True
+                return_early_bible_cleanup = True
             # Инвалидируем старый bible этого канала: если он раньше был
             # построен из текста (или из другого, неверного изображения),
             # он не должен продолжать "стабилизировать неправильный образ".
@@ -984,8 +981,8 @@ def analyze_channel(channel: str, channel_id: str):
             # (см. get_or_create_character_bible) — там уже известны
             # актуальные style/character с фронтенда, а приоритет источника
             # истины отдаст этому только что сохранённому реальному фото.
-            bible_path = project_dir / f"character_bible_{safe_channel_key(channel_id)}.json"
-            if bible_path.exists():
+            bible_path = character_bible_path(channel_id)
+            if return_early_bible_cleanup and bible_path.exists():
                 bible_path.unlink()
         except OSError:
             visual_reference_saved = False
@@ -1038,3 +1035,227 @@ LANGUAGE: <название языка по-английски, например
     "language": language,
     "visual_reference_saved": visual_reference_saved,
 }
+
+
+# ==========================================================================
+# Этапы 3-7: scene script, multi-voice TTS, timeline, scene videos, сборка
+# Тонкие endpoint-ы поверх backend/pipeline.py. Старые endpoint-ы не тронуты.
+# ==========================================================================
+
+from fastapi import HTTPException  # noqa: E402
+
+
+def _pipeline_error(error: pipeline.PipelineError):
+    raise HTTPException(status_code=400, detail={
+        "stage": error.stage,
+        "message": error.message,
+        "retryable": error.retryable,
+        "technical_details": error.details,
+    })
+
+
+@app.get("/autopilot/scene-script")
+def scene_script(topic: str, channel_id: str, character: str = "", style: str = ""):
+    try:
+        bible = get_or_create_character_bible(channel_id, character, style)
+        roster = pipeline.build_character_roster(bible)
+        response = client.responses.create(
+            model="gpt-5.6",
+            input=pipeline.scene_script_prompt(topic, bible, roster),
+        )
+        raw = _parse_json_object(response.output_text)
+        script = pipeline.normalize_scene_script(raw, roster, channel_id=channel_id, topic=topic)
+        pipeline.write_json(pipeline.scene_script_path(channel_id), script)
+        return {"status": "ok", "scene_script": script}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-script-file")
+def scene_script_file(channel_id: str):
+    try:
+        return {"status": "ok", "scene_script": pipeline.load_scene_script(channel_id)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/voice-profiles")
+def voice_profiles(channel_id: str):
+    try:
+        script = pipeline.load_scene_script(channel_id)
+        return {"status": "ok", "voice_profiles": pipeline.get_or_create_voice_profiles(channel_id, script["characters"])}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-voice-plan")
+def scene_voice_plan(channel_id: str):
+    try:
+        script = pipeline.load_scene_script(channel_id)
+        profiles = pipeline.get_or_create_voice_profiles(channel_id, script["characters"])
+        return {"status": "ok", "voice_plan": pipeline.build_voice_plan(channel_id, script, profiles)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-voice")
+def scene_voice(channel_id: str):
+    try:
+        plan = pipeline.read_json(pipeline.voice_plan_path(channel_id))
+        if not plan:
+            script = pipeline.load_scene_script(channel_id)
+            profiles = pipeline.get_or_create_voice_profiles(channel_id, script["characters"])
+            plan = pipeline.build_voice_plan(channel_id, script, profiles)
+        return {"status": "ok", **pipeline.synthesize_voice_plan(channel_id, plan, client)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-audio")
+def scene_audio(channel_id: str, scene_id: int, line_id: int):
+    path = pipeline.run_path(channel_id, "audio", f"scene_{scene_id:03d}_line_{line_id:03d}.mp3", create_parent=False)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Аудиоклип не найден")
+    return FileResponse(path, media_type="audio/mpeg")
+
+
+@app.get("/autopilot/timeline")
+def timeline(channel_id: str):
+    try:
+        script = pipeline.load_scene_script(channel_id)
+        plan = pipeline.read_json(pipeline.voice_plan_path(channel_id))
+        if not plan:
+            raise pipeline.PipelineError("voice_plan.json отсутствует.", stage="timeline", retryable=False)
+        return {"status": "ok", "timeline": pipeline.build_timeline(channel_id, script, plan)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/timeline-file")
+def timeline_file(channel_id: str):
+    try:
+        return {"status": "ok", "timeline": pipeline.load_timeline(channel_id)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/video-plan")
+def video_plan(channel_id: str, provider: str = "mock"):
+    try:
+        script = pipeline.load_scene_script(channel_id)
+        return {"status": "ok", "video_plan": pipeline.build_video_plan(
+            channel_id, script, pipeline.load_timeline(channel_id), provider=provider
+        )}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-videos")
+def scene_videos(channel_id: str):
+    try:
+        plan = pipeline.read_json(pipeline.video_plan_path(channel_id))
+        if not plan:
+            raise pipeline.PipelineError("video_plan.json отсутствует.", stage="scene_videos", retryable=False)
+        return {"status": "ok", **pipeline.generate_scene_videos(channel_id, plan)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/scene-video-file")
+def scene_video_file(channel_id: str, scene_id: int):
+    path = pipeline.run_path(channel_id, "video", f"scene_{scene_id:03d}.mp4", create_parent=False)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Видео сцены не найдено")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/autopilot/assemble-final-video")
+def assemble_final_video(channel_id: str):
+    try:
+        plan = pipeline.read_json(pipeline.video_plan_path(channel_id))
+        if not plan:
+            raise pipeline.PipelineError("video_plan.json отсутствует.", stage="final_video", retryable=False)
+        output = pipeline.assemble_final_video(channel_id, pipeline.load_timeline(channel_id), plan)
+        return {"status": "ok", "final_video": output.name}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/final-video-file")
+def final_video_file(channel_id: str):
+    path = pipeline.final_video_path(channel_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Финальное видео не найдено")
+    return FileResponse(path, media_type="video/mp4")
+
+
+# ==========================================================================
+# Этап 8: job status / retry / lock / orchestration
+# ==========================================================================
+
+def build_stage_runners(topic: str, character: str, style: str, provider: str = "mock") -> dict:
+    """Реестр раннеров: обёртки над УЖЕ существующими функциями этапов."""
+
+    def character_identity(channel_id: str):
+        bible = get_or_create_character_bible(channel_id, character, style)
+        pipeline.save_character_bible(channel_id, bible)
+        if not pipeline.character_ref_path(channel_id).exists():
+            raise pipeline.PipelineError(
+                "Нет постоянного эталона character_ref.png — выполните анализ канала или загрузите фото.",
+                stage="character_identity", retryable=False,
+            )
+
+    def scene_script_stage(channel_id: str):
+        scene_script(topic=topic, channel_id=channel_id, character=character, style=style)
+
+    def voice_plan_stage(channel_id: str):
+        scene_voice_plan(channel_id=channel_id)
+
+    def audio_stage(channel_id: str):
+        scene_voice(channel_id=channel_id)
+
+    def timeline_stage(channel_id: str):
+        timeline(channel_id=channel_id)
+
+    def video_plan_stage(channel_id: str):
+        video_plan(channel_id=channel_id, provider=provider)
+
+    def scene_videos_stage(channel_id: str):
+        scene_videos(channel_id=channel_id)
+
+    def final_video_stage(channel_id: str):
+        assemble_final_video(channel_id=channel_id)
+
+    return {
+        "character_identity": character_identity,
+        "scene_script": scene_script_stage,
+        "voice_plan": voice_plan_stage,
+        "audio_clips": audio_stage,
+        "timeline": timeline_stage,
+        "video_plan": video_plan_stage,
+        "scene_videos": scene_videos_stage,
+        "final_video": final_video_stage,
+    }
+
+
+@app.get("/autopilot/run-pipeline")
+def run_pipeline(channel_id: str, topic: str, character: str = "", style: str = "", provider: str = "mock"):
+    runners = build_stage_runners(topic, character, style, provider)
+    try:
+        return {"status": "ok", "job": jobs.run_autopilot_pipeline(channel_id, runners)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)
+
+
+@app.get("/autopilot/job-status")
+def job_status(channel_id: str):
+    return {"status": "ok", "job": jobs.load_job_status(channel_id)}
+
+
+@app.get("/autopilot/retry-stage")
+def retry_stage(channel_id: str, topic: str, character: str = "", style: str = "", provider: str = "mock"):
+    runners = build_stage_runners(topic, character, style, provider)
+    try:
+        return {"status": "ok", "job": jobs.retry_failed_stage(channel_id, runners)}
+    except pipeline.PipelineError as error:
+        _pipeline_error(error)

@@ -52,3 +52,5 @@ backend/visual_*.png
 backend/speech_*.mp3
 backend/venv/
 backend/__pycache__/
+
+backend/runs/
