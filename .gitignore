@@ -54,3 +54,8 @@ backend/venv/
 backend/__pycache__/
 
 backend/runs/
+
+# OpenNext / Cloudflare
+.open-next/
+.wrangler/
+.dev.vars
